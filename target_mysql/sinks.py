@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
+import os
 import re
 import string
+import tempfile
 import time
 import typing as t
 from typing import Any, Dict, Iterable, List, Optional, cast
@@ -18,10 +21,55 @@ from singer_sdk.sinks import SQLSink
 from sqlalchemy import Column
 from sqlalchemy.dialects import mysql
 from sqlalchemy.engine import Engine, URL
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.schema import PrimaryKeyConstraint
 
 if t.TYPE_CHECKING:
     from sqlalchemy.engine.reflection import Inspector
+
+
+# Module-level cache so cert tempfiles outlive any single connector
+# instance and get cleaned up at process exit. Singer targets are one-shot
+# subprocesses, so atexit teardown is sufficient.
+_CERT_TEMPFILES: list[str] = []
+
+
+def _atexit_cleanup_certs() -> None:
+    for path in _CERT_TEMPFILES:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+atexit.register(_atexit_cleanup_certs)
+
+
+def _materialize_pem_if_inline(value: str | None, hint: str) -> str | None:
+    """Return a filesystem path to PEM content.
+
+    Accepts either a filesystem path (returned as-is) or inline PEM content
+    starting with `-----BEGIN ` (written to a tempfile and the path returned).
+    Tempfiles are tracked module-globally and unlinked at process exit.
+    """
+    if not value:
+        return None
+    text = str(value)
+    if text.startswith("-----BEGIN "):
+        tf = tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".pem",
+            prefix=f"target-mysql-{hint}-",
+            delete=False,
+            encoding="utf-8",
+        )
+        try:
+            tf.write(text)
+        finally:
+            tf.close()
+        _CERT_TEMPFILES.append(tf.name)
+        return tf.name
+    return text  # Treat as path (existence check happens at connect time).
 
 
 class MySQLConnector(SQLConnector):
@@ -37,30 +85,162 @@ class MySQLConnector(SQLConnector):
     allow_temp_tables: bool = True  # Whether temp tables are supported.
     table_name_pattern: str = "${TABLE_NAME}"  # The pattern to use for temp table names.
 
+    # SSH tunnel forwarder kept on the connector instance so it lives as long
+    # as the SQLAlchemy engine. Torn down implicitly at process exit.
+    _ssh_tunnel = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # self.logger.setLevel(logging.DEBUG)
 
         self.allow_column_alter = super().config.get("allow_column_alter", False)
 
+    # ------------------------------------------------------------------
+    # SSH tunnel
+    # ------------------------------------------------------------------
+
+    def _maybe_open_ssh_tunnel(self, config: dict) -> tuple[str, int] | None:
+        """Open an SSH tunnel if `ssh_tunnel.enable` is set.
+
+        Returns (local_host, local_port) for the forwarded MySQL endpoint,
+        or None if no tunnel is required. The forwarder is held on
+        `self._ssh_tunnel` so it stays alive for the engine's lifetime.
+        """
+        ssh = config.get("ssh_tunnel") or {}
+        if not ssh.get("enable"):
+            return None
+        if self._ssh_tunnel is not None:
+            # Already opened (idempotent on repeated get_sqlalchemy_url calls).
+            local = self._ssh_tunnel.local_bind_address
+            return local[0], local[1]
+
+        from sshtunnel import SSHTunnelForwarder
+
+        remote_host = config["host"]
+        remote_port = int(config.get("port", 3306))
+
+        pkey_path = _materialize_pem_if_inline(ssh.get("private_key"), "ssh-key")
+        ssh_password = ssh.get("password")
+
+        # paramiko (under sshtunnel) accepts both ssh_pkey and ssh_password
+        # at the same time; if a key is supplied it tries that first and
+        # falls back to password auth on failure. Real-world configs use
+        # one or the other; we forward both so callers can choose.
+        forwarder = SSHTunnelForwarder(
+            (ssh["host"], int(ssh.get("port", 22))),
+            ssh_username=ssh["username"],
+            ssh_pkey=pkey_path,
+            ssh_private_key_password=ssh.get("private_key_password"),
+            ssh_password=ssh_password,
+            remote_bind_address=(remote_host, remote_port),
+            # local_bind_address auto-picks an ephemeral port on 127.0.0.1
+        )
+        forwarder.start()
+        self._ssh_tunnel = forwarder
+        self.logger.info(
+            "SSH tunnel established: %s:%d -> %s:%d via %s@%s:%d",
+            forwarder.local_bind_address[0],
+            forwarder.local_bind_address[1],
+            remote_host,
+            remote_port,
+            ssh["username"],
+            ssh["host"],
+            int(ssh.get("port", 22)),
+        )
+        return forwarder.local_bind_address[0], forwarder.local_bind_address[1]
+
+    # ------------------------------------------------------------------
+    # SSL connect_args
+    # ------------------------------------------------------------------
+
+    def _build_ssl_connect_args(self, config: dict) -> dict:
+        """Translate ssl_mode + ssl_ca/cert/key into PyMySQL connect_args.
+
+        PyMySQL accepts an `ssl` dict with `ca`, `cert`, `key`, `cipher` (all
+        file paths) and `check_hostname` (bool). To force TLS without cert
+        verification we still pass an `ssl` dict (empty is fine) — PyMySQL
+        takes the presence of `ssl` as the signal to negotiate TLS.
+        """
+        ssl_mode = config.get("ssl_mode")
+        if not ssl_mode or ssl_mode == "disabled":
+            return {}
+
+        ssl_dict: dict[str, t.Any] = {}
+
+        ca = _materialize_pem_if_inline(config.get("ssl_ca"), "ssl-ca")
+        cert = _materialize_pem_if_inline(config.get("ssl_cert"), "ssl-cert")
+        key = _materialize_pem_if_inline(config.get("ssl_key"), "ssl-key")
+        cipher = config.get("ssl_cipher")
+        if ca:
+            ssl_dict["ca"] = ca
+        if cert:
+            ssl_dict["cert"] = cert
+        if key:
+            ssl_dict["key"] = key
+        if cipher:
+            ssl_dict["cipher"] = cipher
+
+        if ssl_mode == "verify_identity":
+            ssl_dict["check_hostname"] = True
+        elif ssl_mode == "verify_ca":
+            ssl_dict["check_hostname"] = False
+        # 'preferred' / 'required' use whatever's in ssl_dict without forcing
+        # cert verification. PyMySQL treats `ssl={}` as "negotiate TLS, accept
+        # any cert" which matches `required` semantics.
+
+        return {"ssl": ssl_dict}
+
+    # ------------------------------------------------------------------
+    # SQLAlchemy URL + engine
+    # ------------------------------------------------------------------
+
     def get_sqlalchemy_url(self, config: dict) -> URL:
         """Generates a SQLAlchemy URL for MySQL.
+
+        If `ssh_tunnel.enable` is set, the URL is rewritten to point at the
+        local end of the forwarder so SQLAlchemy connects through the tunnel.
+        This applies whether the URL is built from discrete host/port/user
+        fields or supplied verbatim via `sqlalchemy_url` — in the latter
+        case we parse the URL, open the tunnel, and replace the URL's
+        `host`/`port` with the local bind address. Query params (e.g.
+        PyMySQL SSL flags) are preserved.
 
         Args:
             config: The configuration for the connector.
         """
-
         if config.get("sqlalchemy_url"):
-            return config["sqlalchemy_url"]
+            url = sqlalchemy.engine.url.make_url(config["sqlalchemy_url"])
+            tunnel = self._maybe_open_ssh_tunnel(
+                {**config, "host": url.host, "port": url.port or 3306}
+            )
+            if tunnel is not None:
+                url = url.set(host=tunnel[0], port=tunnel[1])
+            return url
+
+        host = config["host"]
+        port = config.get("port", "3306")
+        tunnel = self._maybe_open_ssh_tunnel(config)
+        if tunnel is not None:
+            host, port = tunnel
+
+        # Default to PyMySQL; user can override via driver_name to fall back
+        # to mysqlclient (`mysql`).
+        drivername = config.get("driver_name", "mysql+pymysql")
 
         return sqlalchemy.engine.url.URL.create(
-            drivername="mysql",
-            username=config["user"],
+            drivername=drivername,
+            username=config.get("user") or config.get("username"),
             password=config["password"],
-            host=config["host"],
-            port=config["port"],
+            host=host,
+            port=port,
             database=config["database"],
         )
+
+    def create_engine(self) -> Engine:
+        """Override to inject SSL connect_args from config."""
+        url = self.sqlalchemy_url
+        connect_args = self._build_ssl_connect_args(self.config)
+        return sqlalchemy.create_engine(url, connect_args=connect_args, echo=False)
 
     def get_fully_qualified_name(
             self,
@@ -192,7 +372,16 @@ class MySQLConnector(SQLConnector):
                     return cast(sqlalchemy.types.TypeEngine, mysql.BINARY())
 
             # The maximum row size for the used table type, not counting BLOBs, is 65535.
-            maxlength = jsonschema_type.get("maxLength", 1000)
+            #
+            # `default_string_length` (config, default 255) controls the
+            # VARCHAR length used when Singer schema doesn't specify
+            # `maxLength`. Defaulting to 1000 (the 0.1.x behaviour) breaks
+            # under InnoDB's 3072-byte index limit on default MySQL 8
+            # (utf8mb4 = 4 bytes/char): VARCHAR(1000) PK columns fail with
+            # `(1071, 'Specified key was too long')`. 255 fits comfortably
+            # under any modern MySQL InnoDB index limit.
+            default_length = int(self.config.get("default_string_length", 255))
+            maxlength = jsonschema_type.get("maxLength", default_length)
             data_type = mysql.VARCHAR(maxlength)
             if maxlength <= 1000:
                 return cast(sqlalchemy.types.TypeEngine, mysql.VARCHAR(maxlength))
@@ -382,7 +571,28 @@ class MySQLConnector(SQLConnector):
         else:
             _ = sqlalchemy.Table(table_name, meta, *columns)
 
-        meta.create_all(self._engine)
+        try:
+            meta.create_all(self._engine)
+        except OperationalError as e:
+            # Translate the cryptic `(1071, 'Specified key was too long')`
+            # into something operators can act on. Triggered when a string
+            # column declared as VARCHAR exceeds InnoDB's 3072-byte index
+            # limit — typically because a primary-key column was sized at
+            # the legacy default of VARCHAR(1000) under utf8mb4.
+            if "1071" in str(e) or "Specified key was too long" in str(e):
+                pk_cols = ", ".join(primary_keys) if primary_keys else "(none)"
+                raise RuntimeError(
+                    "MySQL refused to create the primary-key index — "
+                    "the key length exceeds InnoDB's 3072-byte limit. This "
+                    "usually means a VARCHAR primary-key column is too wide "
+                    "for the database's charset (utf8mb4 = 4 bytes/char). "
+                    f"Primary keys on '{table_name}': {pk_cols}. Lower the "
+                    "`default_string_length` config (current default 255), "
+                    "or set `maxLength` on the offending Singer property, "
+                    "or switch the database to utf8mb3.\n"
+                    f"Underlying error: {e}"
+                ) from e
+            raise
 
     def merge_sql_types(  # noqa
             self, sql_types: list[sqlalchemy.types.TypeEngine]

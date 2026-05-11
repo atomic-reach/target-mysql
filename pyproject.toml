@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "thk-target-mysql"
-version = "0.1.3"
+version = "0.2.0"
 description = "`target-mysql` is a Singer target for MySQL, built with the Meltano Singer SDK."
 authors = ["Taehwan Kwag <thkwag@gmail.com>"]
 keywords = [
@@ -17,13 +17,29 @@ readme = ["README.md"]
 repository = "https://github.com/thkwag/target-mysql"
 
 [tool.poetry.dependencies]
-python = "<=3.11,>=3.8.1"
+# Allow modern Python (3.12+). Singer SDK 0.30 still imports `pkg_resources`
+# from setuptools — for Python 3.12 callers we recommend `pip install
+# 'setuptools<80'` alongside the loader, or upgrade to singer-sdk 1.x in
+# a future release.
+python = ">=3.8.1,<3.14"
 requests = "^2.25.1"
 singer-sdk = "^0.30.0"
-mysqlclient = "^2.2.0"
+# Default driver: PyMySQL (pure Python, no C build deps). The mysqlclient
+# C-extension is faster but needs system libmysqlclient + headers; users
+# who want it can `pip install mysqlclient` alongside this package and
+# override `driver_name` in their meltano.yml config.
+pymysql = "^1.1.0"
 cryptography = "^41.0.2"
+# SSH tunnel forwarder for bastion-hosted MySQL servers. Mirrors the
+# MeltanoLabs/tap-mysql pattern.
+sshtunnel = "^0.4.0"
+
+[tool.poetry.extras]
+# Optional faster C-extension driver. `pip install thk-target-mysql[mysqlclient]`.
+mysqlclient = ["mysqlclient"]
 
 [tool.poetry.dev-dependencies]
+mysqlclient = "^2.2.0"
 pytest = "^7.4.0"
 tox = "^4.6.4"
 flake8 = "^6.0.0"
